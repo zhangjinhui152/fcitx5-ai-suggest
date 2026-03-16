@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include/Fcitx5/Core",
+                "/usr/include",
+                "/usr/include/Fcitx5/Config",
+                "/usr/include/Fcitx5/Utils",
+                "/usr/include/fcitx-utils"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
