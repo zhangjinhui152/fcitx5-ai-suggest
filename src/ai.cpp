@@ -37,7 +37,7 @@ namespace fcitx
 
         AIAddon(AddonManager *manager) : manager_(manager)
         {
-            printf("AI ver1.6 addon hello\n");
+            printf("AI ver1.7 addon hello\n");
 
             auto *instance = manager_->instance();
 
@@ -47,42 +47,39 @@ namespace fcitx
                 [this](Event &event)
                 {
                     auto &keyEvent = static_cast<KeyEvent &>(event);
+                    auto key = keyEvent.key().toString();
+                    auto ic = keyEvent.inputContext();
+
+                    printf("===== Debug Info =====\n");
+
+                    // 打印原始按键
+                    printf("Key pressed: %s\n", key.c_str());
+
+                    // 打印 preedit 内容
+                    std::string pinyin = getPinyin(ic);
+                    printf("Preedit string: '%s'\n", pinyin.c_str());
+                    printf("Preedit length: %zu\n", pinyin.length());
+
+                    // 检查 preedit 是否真的存在
+                    auto &preedit = ic->inputPanel().preedit();
+                    printf("Preedit empty: %d\n", preedit.empty());
+                    printf("Preedit text: '%s'\n", preedit.toString().c_str());
+
+                    // 打印 buffer 内容
+                    printf("Buffer: '%s'\n", buffer.c_str());
 
                     if (keyEvent.isRelease())
                     {
                         return;
                     }
-                    auto key = keyEvent.key().toString();
 
-                    if (key.size() == 1 && key[0] >= 'a' && key[0] <= 'z')
+                    printf("this->getPinyin(ic) \n");
+                    printf(this->getPinyin(ic).c_str());
+                    if (this->getPinyin(ic) == "zhihu")
                     {
-                        buffer.push_back(key[0]);
+                        printf("this->getPinyin(ic) \n");
+                        this->printCandidates(ic);
                     }
-                    else
-                    {
-                        buffer.clear();
-                    }
-
-                    if (buffer == "zhihu")
-                    {
-                        printf("zhihuDesu\n");
-                        // auto *ic = keyEvent.inputContext();
-                        // // 使用
-                        // auto list = std::make_unique<CommonCandidateList>();
-                        // auto candidate = std::make_unique<MyCandidate>("🤖知乎",
-                        //                                                [ic]()
-                        //                                                { ic->commitString("🤖知乎"); });
-
-                        // list->append(std::move(candidate));
-                        // ic->inputPanel().setCandidateList(std::move(list));
-                        // ic->updateUserInterface(UserInterfaceComponent::InputPanel);
-
-                        this->printCandidates(keyEvent.inputContext());
-                        buffer.clear();
-                        keyEvent.filterAndAccept();
-                    }
-
-                    printf("key: %s\n", key.c_str());
                 });
         }
 
@@ -101,9 +98,31 @@ namespace fcitx
                 printf("候选词 %d: %s\n", i, candidate.text().toString().c_str());
             }
         }
+        // 有些输入法可能把拼音存在其他地方
+        // std::string getPinyin(fcitx::InputContext *ic)
+        // {
+        //     // 方法1: 尝试获取整个输入的字符串
+        //     auto &inputPanel = ic->inputPanel();
+        //     printf("ClientPreedit empty: %d\n", inputPanel.clientPreedit().empty());
+        //     printf("ClientPreedit: '%s'\n", inputPanel.clientPreedit().toString().c_str());
+
+        //     // 方法2: 获取候选词列表的第一个词（如果有）
+        //     auto candidateList = inputPanel.candidateList();
+        //     if (candidateList && candidateList->size() > 0)
+        //     {
+        //         printf("First candidate: %s\n", candidateList->candidate(0).text().toString().c_str());
+        //     }
+
+        //     return inputPanel.preedit().toString();
+        // }
         std::string getPinyin(fcitx::InputContext *ic)
         {
-            return ic->inputPanel().preedit().toString();
+            auto &clientPreedit = ic->inputPanel().clientPreedit();
+            if (!clientPreedit.empty())
+            {
+                return clientPreedit.toString();
+            }
+            return "";
         }
     };
 
