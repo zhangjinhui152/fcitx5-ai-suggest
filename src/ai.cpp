@@ -1,434 +1,363 @@
-#include <cstdio>
-#include <memory>
-#include <string>
-#include <fcitx/addonfactory.h>
-#include <fcitx/addoninstance.h>
-#include <fcitx/addonmanager.h>
-#include <fcitx/candidatelist.h>
-#include <fcitx/candidateaction.h>
-#include <fcitx/event.h>
-#include <fcitx/instance.h>
-#include <fcitx/inputcontext.h>
-#include <fcitx-utils/event.h>
-#include <fcitx/inputpanel.h> // 添加这个头文件
-#include <cstdlib>            // for getenv
-#include <atomic>
-#include <chrono>
-#include <thread>
-
-#include "httplib.h"
-#include "json.hpp" // 需要引入JSON库，或者自己拼字符串
+#include "ai.h"
 #include "ThreadPool.cpp"
-#include <chrono>
+#include <atomic>
+#include <curl/curl.h>
+#include <rapidjson/document.h>
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
+#include <fcitx-config/iniparser.h>
 namespace fcitx
 {
+
     static ThreadPool pool{4};
     static std::atomic<int> debounceId{0};
-    // 正确的方式 ✅
-    class MyCandidate : public fcitx::CandidateWord
+
+    static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
     {
-    public:
-        MyCandidate(const std::string &text, std::function<void()> cb) : callback_(cb)
-        {
-            setText(fcitx::Text(text));
-        }
-        void select(fcitx::InputContext *) const override
-        {
-            if (callback_)
-                callback_();
-        }
+        ((std::string *)userp)->append((char *)contents, size * nmemb);
+        return size * nmemb;
+    }
 
-    private:
-        std::function<void()> callback_;
-    };
-    class AIAddon : public AddonInstance
+    static std::string httpPost(const std::string &url, const std::string &body,
+                                const std::vector<std::pair<std::string, std::string>> &headers,
+                                long timeoutSec = 5)
     {
-    public:
-        std::string buffer;
+        std::string readBuffer;
+        CURL *curl = curl_easy_init();
+        if (!curl)
+            return "";
 
-        AIAddon(AddonManager *manager) : manager_(manager)
+        struct curl_slist *chunk = nullptr;
+        for (const auto &h : headers)
         {
-            printf("AI ver1.9 addon hello\n");
+            std::string headerLine = h.first + ": " + h.second;
+            chunk = curl_slist_append(chunk, headerLine.c_str());
+        }
 
-            auto *instance = manager_->instance();
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSec);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 
-            // 添加preedit更新监听
-            preeditHandler_ = instance->watchEvent(
-                EventType::InputContextUpdatePreedit,
-                EventWatcherPhase::Default,
-                [this, &instance](Event &event)
+        CURLcode res = curl_easy_perform(curl);
+
+        long httpCode = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+        curl_slist_free_all(chunk);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK || httpCode != 200)
+        {
+            printf("[AI] curl error: %s, http: %ld\n", curl_easy_strerror(res), httpCode);
+            return "";
+        }
+
+        return readBuffer;
+    }
+
+    static std::string buildRequestBody(const std::string &prompt, const std::string &model)
+    {
+        rapidjson::Document doc;
+        doc.SetObject();
+        auto &alloc = doc.GetAllocator();
+
+        doc.AddMember("model", rapidjson::Value(model.c_str(), alloc), alloc);
+
+        rapidjson::Value messages(rapidjson::kArrayType);
+
+        // system message
+        rapidjson::Value systemMsg(rapidjson::kObjectType);
+        systemMsg.AddMember("role", "system", alloc);
+        systemMsg.AddMember("content", "You are a helpful assistant that converts pinyin to Chinese words. Only return the most likely word, no explanations.", alloc);
+        messages.PushBack(systemMsg, alloc);
+
+        // user message
+        rapidjson::Value userMsg(rapidjson::kObjectType);
+        userMsg.AddMember("role", "user", alloc);
+        userMsg.AddMember("content", rapidjson::Value(prompt.c_str(), alloc), alloc);
+        messages.PushBack(userMsg, alloc);
+
+        doc.AddMember("messages", messages, alloc);
+
+        // 可选参数
+        doc.AddMember("temperature", 0.3, alloc);
+        doc.AddMember("max_tokens", 50, alloc);
+
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        doc.Accept(writer);
+
+        return buffer.GetString();
+    }
+
+    static std::string parseAnswer(const std::string &jsonStr)
+    {
+        rapidjson::Document doc;
+        doc.Parse(jsonStr.c_str());
+
+        if (doc.HasParseError())
+            return "";
+
+        // 检查是否有 choices 数组
+        if (!doc.HasMember("choices") || !doc["choices"].IsArray() || doc["choices"].Size() == 0)
+            return "";
+
+        const auto &choices = doc["choices"];
+        const auto &firstChoice = choices[0];
+
+        // 检查是否有 message
+        if (!firstChoice.HasMember("message") || !firstChoice["message"].IsObject())
+            return "";
+
+        const auto &message = firstChoice["message"];
+
+        // 检查是否有 content
+        if (!message.HasMember("content") || !message["content"].IsString())
+            return "";
+
+        return message["content"].GetString();
+    }
+
+    MyCandidate::MyCandidate(const std::string &text, std::function<void()> cb)
+        : callback_(cb)
+    {
+        setText(fcitx::Text(text));
+    }
+
+    void MyCandidate::select(fcitx::InputContext *) const
+    {
+        if (callback_)
+            callback_();
+    }
+
+    AIAddon::AIAddon(AddonManager *manager) : manager_(manager)
+    {
+        printf("AI ver2.0 addon hello\n");
+
+        auto *instance = manager_->instance();
+        fcitx::readAsIni(config_, "conf/aiaddon.conf");
+
+        dispatcher_.attach(&instance->eventLoop());
+
+        preeditHandler_ = instance->watchEvent(
+            EventType::InputContextUpdatePreedit,
+            EventWatcherPhase::Default,
+            [this, instance](Event &event)
+            {
+                auto *ic = static_cast<InputContextEvent &>(event).inputContext();
+
+                std::string pinyin = getPinyin(ic);
+                printf("Preedit更新: %s\n", pinyin.c_str());
+
+                if (!config_.enabled.value())
                 {
-                    auto *ic = static_cast<InputContextEvent &>(event).inputContext();
+                    return;
+                }
 
-                    std::string pinyin = getPinyin(ic);
-                    printf("Preedit更新: %s\n", pinyin.c_str());
-
-                    if (pinyin.length() >= 3)
-                    {
-                        // insertAICandidate(ic, pinyin); // 自动处理防重复
-                        fetchAIAsyncDebug(pinyin, ic, &instance->eventLoop()); // 自动处理防重复
-                    }
-                    else
-                    {
-                        // 拼音变短时重置状态
-                        hasInserted = false;
-                        lastInsertedPinyin.clear();
-                    }
-                });
-        }
-
-    private:
-        AddonManager *manager_;
-        std::string lastPinyin;
-        bool zhihuInserted = false; // 添加标志
-        std::unique_ptr<HandlerTableEntry<EventHandler>> handler_;
-        std::unique_ptr<HandlerTableEntry<EventHandler>> preeditHandler_;
-        void printCandidates(fcitx::InputContext *ic)
-        {
-            auto candidateList = ic->inputPanel().candidateList();
-            if (!candidateList)
-                return;
-
-            for (int i = 0; i < candidateList->size(); i++)
-            {
-                auto &candidate = candidateList->candidate(i);
-                printf("候选词 %d: %s\n", i, candidate.text().toString().c_str());
-            }
-        }
-
-        std::string getPinyin(fcitx::InputContext *ic)
-        {
-            auto &clientPreedit = ic->inputPanel().clientPreedit();
-            printf("clientPreedit empty: %d\n", clientPreedit.empty());
-            printf("clientPreedit text: [%s]\n", clientPreedit.toString().c_str());
-            return clientPreedit.toString();
-        }
-        // 包装函数：防止重复插入
-        bool hasInserted = false;       // 标记当前拼音是否已插入
-        std::string lastInsertedPinyin; // 记录最后一次插入的拼音
-
-        // 读取环境变量
-        std::string getApiKey()
-        {
-            const char *key = std::getenv("FCITX5_AI_APIKEY");
-            return key ? std::string(key) : "";
-        }
-
-        void insertCandidate(fcitx::InputContext *ic, int position, const std::string &text, std::function<void()> callback)
-        {
-            auto candidateList = ic->inputPanel().candidateList();
-            if (!candidateList)
-                return;
-
-            auto modifiableList = candidateList->toModifiable();
-            if (modifiableList)
-            {
-                auto candidate = std::make_unique<MyCandidate>(text, callback);
-                modifiableList->insert(position, std::move(candidate));
-
-                // 更新界面
-                ic->updateUserInterface(UserInterfaceComponent::InputPanel);
-            }
-        }
-        void insertAICandidate(fcitx::InputContext *ic, const std::string &pinyin)
-        {
-            // 如果已经为这个拼音插入过了，就不再插入
-            if (hasInserted && lastInsertedPinyin == pinyin)
-            {
-                return;
-            }
-
-            // 插入新候选词
-            insertCandidate(ic, 3, "🤖AI: " + pinyin, [ic, pinyin]()
-                            { ic->commitString("AI结果: " + pinyin); });
-
-            // 更新状态
-            lastInsertedPinyin = pinyin;
-            hasInserted = true;
-        }
-
-        void fetchAI(const std::string &pinyin, fcitx::InputContext *ic) // 添加 ic 参数
-        {
-            std::string apiKey = getApiKey();
-            if (apiKey.empty())
-            {
-                printf("错误: 未设置 FCITX5_AI_APIKEY 环境变量\n");
-                return;
-            }
-
-            // 创建 HTTPS 客户端（注意是 https）
-            httplib::SSLClient cli("https://dashscope.aliyuncs.com");
-
-            // 设置请求头
-            httplib::Headers headers = {
-                {"Authorization", "Bearer " + apiKey},
-                {"Content-Type", "application/json"}};
-
-            // 构造请求体 - 使用你的问题示例
-            using namespace nlohmann;
-            std::string prompt = "拼音'" + pinyin + "'最可能的词语是？只返回词语";
-            json body = {
-                {"model", "qwen3.5-flash"},
-                {"input", prompt}, // 这里可以用 pinyin 或自定义问题
-                {"extra_body", {{"enable_thinking", false}}}};
-
-            // 发送 POST 请求
-            auto res = cli.Post("/api/v2/apps/protocols/compatible-mode/v1/responses",
-                                headers,
-                                body.dump(),
-                                "application/json");
-            if (!res)
-            {
-                printf("[AI] ❌ 请求失败: %d\n", res.error());
-                return;
-            }
-            if (res && res->status == 200)
-            {
-                // 解析响应
-                json response = json::parse(res->body);
-
-                // 遍历输出项
-                for (const auto &item : response["output"])
+                if (pinyin.length() >= 3)
                 {
-                    if (item["type"] == "reasoning")
+                    try
                     {
-                        printf("【推理过程】\n");
-                        for (const auto &summary : item["summary"])
-                        {
-                            std::string text = summary["text"];
-                            printf("%.500s\n", text.c_str()); // 截取前500字符
-                        }
-                        printf("\n");
+                        fetchAIAsyncDebug(pinyin, ic);
                     }
-                    else if (item["type"] == "message")
+                    catch (const std::exception &e)
                     {
-                        printf("【最终答案】\n");
-                        std::string answer = item["content"][0]["text"];
-                        printf("%s\n", answer.c_str());
-
-                        // 这里可以把 answer 插入到候选词列表
-                        // 显示 "🤖AI: 9.11 > 9.9"，但选中后只上屏 "9.11 > 9.9"
-                        insertCandidate(ic, 0, "🤖AI: " + answer, [ic, answer]()
-                                        { ic->commitString(answer); });
+                        std::cerr << e.what() << '\n';
                     }
                 }
-            }
-            else
-            {
-                printf("请求失败: %d - %s\n",
-                       res ? res->status : -1,
-                       res ? res->body.c_str() : "连接失败");
-            }
-        }
+                else
+                {
+                    hasInserted = false;
+                    lastInsertedPinyin.clear();
+                }
+            });
+    }
 
-        void fetchAIAsync(const std::string &pinyin,
-                          fcitx::InputContext *ic,
-                          fcitx::EventLoop *eventLoop)
-        {
-            static std::atomic<int> debounceId{0};
-            static ThreadPool pool{4};
-
-            int id = ++debounceId;
-
-            std::thread([=]()
-                        {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-                            if (id != debounceId)
-                                return;
-
-                            pool.enqueue([=]()
-                                         {
-                                             std::string apiKey = getApiKey();
-                                             if (apiKey.empty())
-                                                 return;
-
-                                             httplib::Client cli("https://dashscope.aliyuncs.com");
-                                             cli.set_connection_timeout(2);
-                                             cli.set_read_timeout(3);
-
-                                             httplib::Headers headers = {
-                                                 {"Authorization", "Bearer " + apiKey},
-                                                 {"Content-Type", "application/json"}};
-
-                                             using json = nlohmann::json;
-                                             std::string prompt = "拼音'" + pinyin + "'最可能的词语是？只返回词语";
-
-                                             json body = {
-                                                 {"model", "qwen3.5-flash"},
-                                                 {"input", prompt},
-                                                 {"extra_body", {{"enable_thinking", false}}}};
-
-                                             auto res = cli.Post(
-                                                 "/api/v2/apps/protocols/compatible-mode/v1/responses",
-                                                 headers,
-                                                 body.dump(),
-                                                 "application/json");
-
-                                             if (!res || res->status != 200)
-                                                 return;
-
-                                             json response = json::parse(res->body);
-
-                                             std::string answer;
-                                             for (const auto &item : response["output"])
-                                             {
-                                                 if (item["type"] == "message")
-                                                 {
-                                                     answer = item["content"][0]["text"];
-                                                     break;
-                                                 }
-                                             }
-
-                                             if (answer.empty())
-                                                 return;
-
-                                             // ✅ 正确回主线程
-                                             auto _ = eventLoop->addPostEvent([=](fcitx::EventSource *) {
-                                                insertCandidate(
-                                                    ic,
-                                                    0,
-                                                    "🤖AI: " + answer,
-                                                    [ic, answer]() {
-                                                        ic->commitString(answer);
-                                                    }
-                                                );
-                                                return true;
-                                            });
-                                         }); })
-                .detach();
-        }
-
-        void fetchAIAsyncDebug(const std::string &pinyin,
-                               fcitx::InputContext *ic,
-                               fcitx::EventLoop *eventLoop)
-        {
-            static std::atomic<int> debounceId{0};
-            static ThreadPool pool{4};
-
-            int id = ++debounceId;
-
-            printf("[AI] 输入: %s | debounceId=%d\n", pinyin.c_str(), id);
-
-            std::thread([=]()
-                        {
-                            printf("[AI] 进入 debounce 等待: id=%d\n", id);
-
-                            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-                            if (id != debounceId)
-                            {
-                                printf("[AI] debounce 被取消: id=%d (最新=%d)\n", id, (int)debounceId.load());
-                                return;
-                            }
-
-                            printf("[AI] debounce 通过，进入线程池: id=%d\n", id);
-
-                            pool.enqueue([=]()
-                                         {
-                                             printf("[AI] 开始请求: id=%d, pinyin=%s\n", id, pinyin.c_str());
-
-                                             std::string apiKey = getApiKey();
-                                             if (apiKey.empty())
-                                             {
-                                                 printf("[AI] ❌ API Key 为空\n");
-                                                 return;
-                                             }
-
-                                             httplib::Client cli("https://dashscope.aliyuncs.com");
-                                             cli.set_connection_timeout(2);
-                                             cli.set_read_timeout(3);
-
-                                             httplib::Headers headers = {
-                                                 {"Authorization", "Bearer " + apiKey},
-                                                 {"Content-Type", "application/json"}};
-
-                                             using json = nlohmann::json;
-                                             std::string prompt = "拼音'" + pinyin + "'最可能的词语是？只返回词语";
-
-                                             json body = {
-                                                 {"model", "qwen3.5-flash"},
-                                                 {"input", prompt},
-                                                 {"extra_body", {{"enable_thinking", false}}}};
-
-                                             auto res = cli.Post(
-                                                 "/api/v2/apps/protocols/compatible-mode/v1/responses",
-                                                 headers,
-                                                 body.dump(),
-                                                 "application/json");
-
-                                             if (!res)
-                                             {
-                                                 printf("[AI] ❌ 请求失败: 无响应\n");
-                                                 return;
-                                             }
-
-                                             if (res->status != 200)
-                                             {
-                                                 printf("[AI] ❌ HTTP错误: %d\n%s\n", res->status, res->body.c_str());
-                                                 return;
-                                             }
-
-                                             printf("[AI] ✅ 请求成功: id=%d\n", id);
-
-                                             json response;
-                                             try
-                                             {
-                                                 response = json::parse(res->body);
-                                             }
-                                             catch (...)
-                                             {
-                                                 printf("[AI] ❌ JSON解析失败\n");
-                                                 return;
-                                             }
-
-                                             std::string answer;
-                                             for (const auto &item : response["output"])
-                                             {
-                                                 if (item["type"] == "message")
-                                                 {
-                                                     answer = item["content"][0]["text"];
-                                                     break;
-                                                 }
-                                             }
-
-                                             if (answer.empty())
-                                             {
-                                                 printf("[AI] ⚠️ 没有拿到答案\n");
-                                                 return;
-                                             }
-
-                                             printf("[AI] 🎯 AI结果: %s (id=%d)\n", answer.c_str(), id);
-
-                                             // 👉 回主线程
-                                             auto _ = eventLoop->addPostEvent([=](fcitx::EventSource *)
-                                                                              {
-                printf("[AI] 📌 插入候选: %s (id=%d)\n", answer.c_str(), id);
-
-                insertCandidate(
-                    ic,
-                    0,
-                    "🤖AI: " + answer,
-                    [ic, answer]() {
-                        printf("[AI] ✅ commit: %s\n", answer.c_str());
-                        ic->commitString(answer);
-                    }
-                );
-
-                return true; });
-                                         }); })
-                .detach();
-        }
-    };
-
-    class AIAddonFactory : public AddonFactory
+    void AIAddon::printCandidates(fcitx::InputContext *ic)
     {
-    public:
-        AddonInstance *create(AddonManager *manager) override
+        auto candidateList = ic->inputPanel().candidateList();
+        if (!candidateList)
+            return;
+
+        for (int i = 0; i < candidateList->size(); i++)
         {
-            return new AIAddon(manager);
+            auto &candidate = candidateList->candidate(i);
+            printf("候选词 %d: %s\n", i, candidate.text().toString().c_str());
         }
-    };
+    }
+
+    std::string AIAddon::getPinyin(fcitx::InputContext *ic)
+    {
+        auto &clientPreedit = ic->inputPanel().clientPreedit();
+        printf("clientPreedit empty: %d\n", clientPreedit.empty());
+        printf("clientPreedit text: [%s]\n", clientPreedit.toString().c_str());
+        return clientPreedit.toString();
+    }
+
+    std::string AIAddon::getApiKey()
+    {
+        return config_.apiKey.value(); // 直接从配置对象获取
+    }
+
+    std::string AIAddon::getConfigKeyValue(std::string key)
+    {
+        return config_.timeout.value(); // 直接从配置对象获取
+    }
+
+    void AIAddon::insertCandidate(fcitx::InputContext *ic, int position, const std::string &text, std::function<void()> callback)
+    {
+        auto candidateList = ic->inputPanel().candidateList();
+        if (!candidateList)
+            return;
+
+        auto modifiableList = candidateList->toModifiable();
+        if (modifiableList)
+        {
+            auto candidate = std::make_unique<MyCandidate>(text, callback);
+            modifiableList->insert(position, std::move(candidate));
+            ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+        }
+    }
+
+    void AIAddon::insertAICandidate(fcitx::InputContext *ic, const std::string &pinyin)
+    {
+        if (hasInserted && lastInsertedPinyin == pinyin)
+        {
+            return;
+        }
+
+        insertCandidate(ic, 3, "🤖AI: " + pinyin, [ic, pinyin]()
+                        { ic->commitString("AI结果: " + pinyin); });
+
+        lastInsertedPinyin = pinyin;
+        hasInserted = true;
+    }
+
+    void AIAddon::fetchAIAsyncDebug(const std::string &pinyin,
+                                    fcitx::InputContext *ic)
+    {
+        static std::atomic<int> debounceId{0};
+        static ThreadPool pool{4};
+
+        int id = ++debounceId;
+
+        auto icRef = ic->watch();
+
+        std::string apiKey = getApiKey();
+        std::string promptTemplate = config_.prompt.value();
+        std::string apiUrl = config_.apiUrl.value();
+        std::string model = config_.model.value();
+        int timeout = 5;
+        try {
+            timeout = std::stoi(config_.timeout.value());
+        } catch (...) {}
+
+        printf("[AI] 输入: %s | debounceId=%d\n", pinyin.c_str(), id);
+
+        std::thread([=]()
+                    {
+        printf("[AI] 进入 debounce 等待: id=%d\n", id);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        if (id != debounceId)
+        {
+                        printf("[AI] debounce 被取消: id=%d (最新=%d)\n", id, (int)debounceId.load());
+            return;
+        }
+
+        printf("[AI] debounce 通过，开始请求: id=%d\n", id);
+
+        if (apiKey.empty())
+        {
+            printf("[AI] ❌ API Key 为空\n");
+            return;
+        }
+
+        std::string promptText = promptTemplate;
+        size_t pos = promptText.find("{input}");
+        if (pos != std::string::npos) {
+            promptText.replace(pos, 7, pinyin);
+        }
+        std::string body = buildRequestBody(promptText, model);
+
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Authorization", "Bearer " + apiKey},
+            {"Content-Type", "application/json"}};
+
+        printf("[AI] timeout=%d\n", timeout);
+
+        std::string responseStr = httpPost(apiUrl, body, headers, timeout);
+
+        if (responseStr.empty())
+        {
+            printf("[AI] ❌ 请求失败\n");
+            return;
+        }
+
+        printf("[AI] ✅ 请求成功: id=%d\n", id);
+
+        std::string answer = parseAnswer(responseStr);
+
+        if (answer.empty())
+        {
+            printf("[AI] ⚠️ 没有拿到答案\n");
+            return;
+        }
+
+        printf("[AI] 🎯 AI结果: %s (id=%d)\n", answer.c_str(), id);
+
+        dispatcher_.schedule([=]() {
+            auto ic = icRef.get();
+
+            if (!ic)
+            {
+                printf("[AI] ⚠️ IC 已失效，跳过 (id=%d)\n", id);
+                return;
+            }
+
+            printf("[AI] 📌 插入候选: %s (id=%d)\n",
+                   answer.c_str(), id);
+
+            insertCandidate(
+                ic,
+                config_.insertposition.value(),
+                "🤖AI: " + answer,
+                [icRef, answer]() {
+                    auto ic = icRef.get();
+                    if (!ic)
+                        return;
+
+                    printf("[AI] ✅ commit: %s\n", answer.c_str());
+                    ic->commitString(answer);
+                });
+        });
+    }).detach();
+    }
+
+    const fcitx::Configuration *AIAddon::getConfig() const
+    {
+        return &config_;
+    }
+
+    void AIAddon::setConfig(const fcitx::RawConfig &config)
+    {
+        config_.load(config, true);
+        // 保存到文件
+        fcitx::safeSaveAsIni(config_, "conf/aiaddon.conf");
+    }
+
+    AddonInstance *AIAddonFactory::create(AddonManager *manager)
+    {
+        return new AIAddon(manager);
+    }
 
 } // namespace fcitx
 
