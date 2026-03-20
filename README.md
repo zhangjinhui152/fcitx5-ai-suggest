@@ -30,10 +30,12 @@ InsertPosition=3
 APIKey=your-api-key-here
 ApiUrl=https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
 Model=qwen-plus
+MinimumLength=3
+DebounceTime=300
+CacheSize=100
 TimeOut=10
 Prompt=拼音'{input}'最可能的词语是？只返回词语
 ```
-
 
 | 配置项         | 说明                                     | 默认值                                    |
 | -------------- | ---------------------------------------- | ----------------------------------------- |
@@ -42,6 +44,9 @@ Prompt=拼音'{input}'最可能的词语是？只返回词语
 | APIKey         | API Key                                  | 空                                        |
 | ApiUrl         | OpenAI 兼容的 API 地址                   | 阿里云 DashScope                          |
 | Model          | 模型名称                                 | qwen-plus                                 |
+| MinimumLength  | 最小拼音长度（小于此值不发请求）         | 3                                         |
+| DebounceTime   | 防抖等待时间（毫秒）                     | 300                                       |
+| CacheSize      | LRU 缓存容量（条）                       | 100                                       |
 | TimeOut        | 请求超时时间（秒）                       | 10                                        |
 | Prompt         | 提示词模板，`{input}` 会被替换为实际拼音 | `拼音'{input}'最可能的词语是？只返回词语` |
 
@@ -76,7 +81,7 @@ src/
 
 ---
 
-### 1. 配置系统 (`ai.h:21-28`)
+### 1. 配置系统 (`ai.h:24-35`)
 
 ```cpp
 FCITX_CONFIGURATION(
@@ -86,6 +91,9 @@ FCITX_CONFIGURATION(
     fcitx::Option<std::string> apiKey{this, "APIKey", _("API Key"), ""};
     fcitx::Option<std::string> apiUrl{this, "ApiUrl", _("API URL"), "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"};
     fcitx::Option<std::string> model{this, "Model", _("Model"), "qwen-plus"};
+    fcitx::Option<int> minimumLength{this, "MinimumLength", _("Minimum Pinyin Length"), 3};
+    fcitx::Option<int> debounceTime{this, "DebounceTime", _("Debounce Time (ms)"), 300};
+    fcitx::Option<int> cacheSize{this, "CacheSize", _("Cache Size"), 100};
     fcitx::Option<std::string> timeout{this, "TimeOut", _("TimeOut"), "10"};
     fcitx::Option<std::string> prompt{this, "Prompt", _("Prompt"), "拼音'{input}'最可能的词语是？只返回词语"};
 );
